@@ -1,0 +1,268 @@
+{
+  "name": "Social CRM - Message Analysis",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webhook/message-analysis",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "message-analysis"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst secret = $env.N8N_WEBHOOK_SECRET;\nconst timestamp = $input.item.json.headers['x-timestamp'];\nconst signature = $input.item.json.headers['x-signature'];\nconst body = JSON.stringify($input.item.json.body);\n\nif (!secret) {\n  return { valid: true, data: $input.item.json.body };\n}\n\nconst message = `${timestamp}.${body}`;\nconst hmac = crypto.createHmac('sha256', secret);\nhmac.update(message);\nconst expectedSignature = hmac.digest('hex');\n\nif (signature !== expectedSignature) {\n  throw new Error('Invalid signature');\n}\n\nconst timestampDate = new Date(timestamp);\nconst now = new Date();\nconst diffMinutes = Math.abs(now - timestampDate) / 60000;\nif (diffMinutes > 5) {\n  throw new Error('Timestamp expired');\n}\n\nreturn { valid: true, data: $input.item.json.body };"
+      },
+      "id": "verify-signature",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "type": "string"
+          },
+          "conditions": [
+            {
+              "id": "required-fields",
+              "leftValue": "={{ $json.data.job_id && $json.data.channel && $json.data.message_external_id && $json.data.conversation_external_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "validate-input",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 500
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Eres un analizador de mensajes para un CRM. Analiza mensajes y proporciona clasificación estructurada en JSON."
+            },
+            {
+              "role": "user",
+              "content": "Analiza el siguiente mensaje:\n\nMensaje: {{ $json.data.text }}\nCanal: {{ $json.data.channel }}\nÚltimos mensajes: {{ JSON.stringify($json.data.context.last_messages) }}\n\nProporciona JSON con:\n- intent: venta | soporte | informacion | otro\n- urgency: baja | media | alta | critica\n- sentiment: positivo | neutro | negativo\n- summary: 1-2 frases\n- language: código ISO\n- entities: objeto con nombre, empresa, email, telefono, presupuesto, fecha"
+            }
+          ]
+        }
+      },
+      "id": "llm-classify",
+      "name": "LLM: Classify",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 300
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Genera respuestas profesionales y amigables adaptadas al estilo del equipo."
+            },
+            {
+              "role": "user",
+              "content": "Genera una respuesta sugerida para:\n\nMensaje: {{ $json.data.text }}\nContexto: {{ $json.summary }}\nIntención: {{ $json.intent }}\n\nResponde solo con el texto de la respuesta sugerida."
+            }
+          ]
+        }
+      },
+      "id": "llm-generate-reply",
+      "name": "LLM: Generate Reply",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const intent = $json.intent;\nconst urgency = $json.urgency;\nconst confidence = 0.85; // TODO: calcular desde LLM\n\nlet recommendedRole = 'agent';\nlet priority = 5;\nlet autoSendRecommended = false;\n\nif (intent === 'venta' && confidence > 0.8) {\n  recommendedRole = 'admin';\n  priority = 8;\n} else if (urgency === 'critica') {\n  recommendedRole = 'admin';\n  priority = 10;\n} else if (intent === 'soporte' && urgency === 'alta') {\n  priority = 7;\n}\n\nif (urgency === 'baja' && confidence > 0.9 && intent !== 'venta') {\n  autoSendRecommended = true;\n}\n\nreturn {\n  job_id: $('Verify Signature').item.json.data.job_id,\n  status: 'completed',\n  output: {\n    intent: $json.intent,\n    urgency: $json.urgency,\n    sentiment: $json.sentiment,\n    summary: $json.summary,\n    suggested_reply: $json.text || $json.content,\n    confidence: confidence,\n    language: $json.language || 'es',\n    entities: $json.entities || {},\n    routing: {\n      recommended_role: recommendedRole,\n      priority: priority,\n      auto_send_recommended: autoSendRecommended\n    }\n  },\n  meta: {\n    n8n_execution_id: $execution.id,\n    model: 'gpt-4o',\n    prompt_version: '1.0',\n    latency_ms: Date.now() - $execution.startedAt\n  }\n};"
+      },
+      "id": "format-output",
+      "name": "Format Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Verify Signature').item.json.data.context.callback_url || $env.APP_BASE_URL + '/api/webhooks/n8n' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Signature",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            },
+            {
+              "name": "X-Timestamp",
+              "value": "={{ $now.toISO() }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": []
+        },
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "callback-http",
+      "name": "Callback HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, job_id: $('Verify Signature').item.json.data.job_id } }}"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "LLM: Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Classify": {
+      "main": [
+        [
+          {
+            "node": "LLM: Generate Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Generate Reply": {
+      "main": [
+        [
+          {
+            "node": "Format Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Output": {
+      "main": [
+        [
+          {
+            "node": "Callback HTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Callback HTTP": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-01-15T10:00:00.000Z",
+  "versionId": "1"
+}
